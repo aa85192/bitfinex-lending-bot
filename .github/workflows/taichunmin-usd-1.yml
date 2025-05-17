@@ -43,7 +43,7 @@ jobs:
           cache: 'yarn'
       - name: Install dependencies, eslint, and run
         env:
-          INPUT_AMOUNT: 450
+          INPUT_AMOUNT: 0
           # https://api-pub.bitfinex.com/v2/conf/pub:list:currency:margin
           # https://api-pub.bitfinex.com/v2/conf/pub:map:currency:sym
           # https://api-pub.bitfinex.com/v2/conf/pub:map:currency:label
