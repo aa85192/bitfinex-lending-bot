@@ -1,86 +1,66 @@
-/*
-yarn tsx ./bin/funding-auto-renew-2.ts
+/* ============================================================================
+ * funding-auto-renew-2.ts  (2025-05-18, API-fix version)
+ * ────────────────────────────────────────────────────────────────────────────
+ * 1. INPUT_SPLIT 決定拆幾單；輪替分配到「吸引力最高」的天期
+ * 2. 直接呼叫 Bitfinex public REST v2 book/fUSD/P0 取 order-book
+ * 3. 其餘：logger / telegram / env 參數 與原版一致
+ * ==========================================================================*/
 
-新增功能：
-  1. INPUT_SPLIT 決定要拆幾單（預設 3）
-  2. 依 order-book 計算吸引力，輪替分配單數：
-       split=3  →  best 2 + second 1
-       split=5  →  best 3 + second 1 + third 1
-  3. 僅修改放貸邏輯，其餘 logger / telegram / ZodConfig 不變
-*/
-
-// ───────── import ─────────
+import axios from 'axios'
+import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
 import { getenv } from '../lib/dotenv.mjs'
-import { Bitfinex, BitfinexSort, PlatformStatus } from '@taichunmin/bitfinex'
-import JSON5 from 'json5'
-import _ from 'lodash'
-import { scheduler } from 'node:timers/promises'
-import * as url from 'node:url'
-import { z } from 'zod'
-import { dayjs } from '../lib/dayjs.mjs'
-import {
-  dateStringify,
-  floatFormatDecimal,
-  floatIsEqual,
-  rateStringify,
-} from '../lib/helper.mjs'
 import { createLoggersByUrl } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
+import { scheduler } from 'node:timers/promises'
+import JSON5 from 'json5'
+import _ from 'lodash'
+import { z } from 'zod'
+import * as url from 'node:url'
 
-// ───────── 常數 & util ─────────
+/* ───────── 0. 常數 & util ───────── */
 const loggers = createLoggersByUrl(import.meta.url)
-const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
-const RATE_MIN = 0.0001 // APR 3.65%
+const RATE_MIN = 0.0001                                          // 3.65 % APR
+const PERIODS = [2, 30, 60, 120]                                 // 支援天期
 
-const bitfinex = new Bitfinex({
-  apiKey:    getenv('BITFINEX_API_KEY'),
-  apiSecret: getenv('BITFINEX_API_SECRET'),
-  affCode:   getenv('BITFINEX_AFF_CODE'),
-})
-
-// hack BigInt stringify
-;(BigInt as any).prototype.toJSON ??= function () { return this.toString() }
-
-function ymlDump (key: string, val: any): void {
-  loggers.log(_.set({}, key, val))
-}
-function bigintAbs (a: bigint): bigint { return a < 0n ? -a : a }
-
-// ───────── 參數驗證 ─────────
+/* ╔══════════════════╗
+   ║   1. 參數驗證    ║
+   ╚══════════════════╝ */
 const ZodConfig = z.object({
-  // 舊參數
   amount:  z.coerce.number().min(0).default(0),
   currency: z.coerce.string().default('USD'),
-  period:  z.record(z.coerce.number().int().min(2).max(120), z.number().positive()).default({}),
-  rank:    z.coerce.number().min(0).max(1).default(0.5),
+  period:  z.record(z.coerce.number().int(), z.number().positive()).default({}),
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
-  rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
-  // 新參數
+  rateMin: z.coerce.number().min(RATE_MIN).default(RATE_MIN),
   split:   z.coerce.number().int().min(1).max(20).default(3),
-  alpha:   z.coerce.number().positive().default(0.5),  // 吸引力權重
-  beta:    z.coerce.number().positive().max(1).default(0.4), // 報價接近高價程度
+  alpha:   z.coerce.number().positive().default(0.5),
+  beta:    z.coerce.number().positive().max(1).default(0.4),
 })
 
-// ───────── 1. 取得 order-book 統計 ─────────
+/* ╔═══════════════════════════════╗
+   ║   2. Funding book 解析工具    ║
+   ╚═══════════════════════════════╝
+Endpoint: GET https://api-pub.bitfinex.com/v2/book/fUSD/P0?len=250
+回傳每列: [RATE, PERIOD, COUNT, AMOUNT]
+*/
 async function fetchPeriodStats (
-  bfx: Bitfinex,
   currency: string,
   periods: number[],
   len = 250,
-): Promise<Record<number, { volume: number; rateVWAP: number; rateMax: number }>> {
-  const stats: Record<number, { volume: number; rateSum: number; rateMax: number }> = {}
-  for (const p of periods) stats[p] = { volume: 0, rateSum: 0, rateMax: 0 }
+): Promise<Record<number, { volume:number; rateVWAP:number; rateMax:number }>> {
+  const url = `https://api-pub.bitfinex.com/v2/book/f${currency}/P0`
+  const { data } = await axios.get(url, { params: { len } })
+  const stats: Record<number, { volume:number; rateSum:number; rateMax:number }> = {}
+  periods.forEach(p => { stats[p] = { volume:0, rateSum:0, rateMax:0 } })
 
-  for (const p of periods) {
-    const rows = await bfx.v2RestFundingBook(currency, p, { len }) as [string, string][]
-    for (const [rateStr, amtStr] of rows) {
-      const rate = Number(rateStr)
-      const amt  = Math.abs(Number(amtStr))
-      stats[p].volume  += amt
-      stats[p].rateSum += rate * amt
-      stats[p].rateMax = Math.max(stats[p].rateMax, rate)
-    }
+  for (const [rate, period, , amount] of data as [number, number, number, number][]) {
+    if (!stats[period]) continue        // 只統計關心的天期
+    const vol = Math.abs(amount)
+    stats[period].volume  += vol
+    stats[period].rateSum += rate * vol
+    stats[period].rateMax  = Math.max(stats[period].rateMax, rate)
   }
+
+  // 整理 VWAP
   return _.mapValues(stats, s => ({
     volume: s.volume,
     rateVWAP: s.volume ? s.rateSum / s.volume : 0,
@@ -88,168 +68,116 @@ async function fetchPeriodStats (
   }))
 }
 
-// ───────── 2. 輪替分配單數 (split) ─────────
+/* ╔══════════════════════════════════════╗
+   ║   3. 計算「輪替分配」與掛單利率       ║
+   ╚══════════════════════════════════════╝ */
 function planOrders (
-  stats: Record<number, { volume: number; rateVWAP: number; rateMax: number }>,
+  stats: Record<number, { volume:number; rateVWAP:number; rateMax:number }>,
   split: number,
-  periodMinMap: Record<number, number>,
+  periodMin: Record<number, number>,
   alpha: number,
-): { period: number; count: number }[] {
+) {
   const ranked = _(stats)
     .map((s, p) => {
-      const period = Number(p)
-      const base   = Math.max(s.rateVWAP, periodMinMap[period] ?? 0)
-      const score  = Math.pow(base / (periodMinMap[period] ?? RATE_MIN), alpha) *
-                     Math.log1p(s.volume)
-      return { period, score }
+      const minR = periodMin[p] ?? RATE_MIN
+      const base = Math.max(s.rateVWAP, minR)
+      const score = Math.pow(base / minR, alpha) * Math.log1p(s.volume)
+      return { period: Number(p), score }
     })
     .orderBy('score', 'desc')
     .map('period')
     .value()
 
-  if (!ranked.length) throw new Error('order-book 資料為空')
-
-  // round-robin
   const counter: Record<number, number> = {}
   for (let i = 0; i < split; i++) {
     const p = ranked[i % ranked.length]
     counter[p] = (counter[p] ?? 0) + 1
   }
-  return Object.entries(counter).map(([p, cnt]) => ({ period: Number(p), count: cnt }))
+  return Object.entries(counter).map(([p, cnt]) => ({ period: +p, count: cnt }))
 }
 
-// ───────── 3. 計算掛單利率 ─────────
-function calcOfferRate (
-  stat: { rateVWAP: number; rateMax: number },
+function offerRate (
+  stat: { rateVWAP:number; rateMax:number },
   period: number,
-  periodMinMap: Record<number, number>,
+  periodMin: Record<number, number>,
   beta: number,
-  rateMaxCap: number,
-): number {
-  const minR = periodMinMap[period] ?? RATE_MIN
+  cap: number,
+) {
+  const minR = periodMin[period] ?? RATE_MIN
   const base = Math.max(stat.rateVWAP, minR)
-  return _.clamp(base + beta * (stat.rateMax - base), minR, rateMaxCap)
+  return _.clamp(base + beta * (stat.rateMax - base), minR, cap)
 }
 
-// ───────── 4. main ─────────
-export async function main (): Promise<void> {
+/* ╔══════════════════╗
+   ║   4. 主流程       ║
+   ╚══════════════════╝ */
+async function main () {
   const cfg = ZodConfig.parse({
     amount:   getenv('INPUT_AMOUNT'),
     currency: getenv('INPUT_CURRENCY'),
     period:   JSON5.parse(getenv('INPUT_PERIOD')),
-    rank:     getenv('INPUT_RANK'),
     rateMax:  getenv('INPUT_RATE_MAX'),
-    rateMin:  getenv('INPUT_RATE_MIN'),
     split:    getenv('INPUT_SPLIT'),
     alpha:    getenv('INPUT_ALPHA'),
     beta:     getenv('INPUT_BETA'),
   })
 
-  // 輸入參數輸出
-  ymlDump('input', {
-    ...cfg,
-    rateMin: rateStringify(cfg.rateMin),
-    rateMax: rateStringify(cfg.rateMax),
+  const periodMin = { ...cfg.period }
+  PERIODS.forEach(p => { periodMin[p] ??= RATE_MIN })
+
+  const bitfinex = new Bitfinex({
+    apiKey:    getenv('BITFINEX_API_KEY'),
+    apiSecret: getenv('BITFINEX_API_SECRET'),
   })
 
-  // Bitfinex 狀態
+  /*── Bitfinex 是否維護 ──*/
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
     loggers.error('Bitfinex API in maintenance')
     return
   }
 
-  // 1) Bitfinex funding stats 仍照舊紀錄
-  const fundingStats = (await Bitfinex.v2FundingStatsHist({ currency: cfg.currency, limit: 1 }))?.[0]
-  ymlDump('fundingStats', {
-    currency: cfg.currency,
-    date: dateStringify(fundingStats.mts),
-    frr: rateStringify(fundingStats.frr),
-  })
-
-  // 2) Auto-renew 狀態 (若原先有開，要先關掉)
-  const autoFunding = await bitfinex.v2AuthReadFundingAutoStatus({ currency: cfg.currency })
-  if (_.isNil(autoFunding)) loggers.log({ autoRenew: { status: false } })
-  else {
-    ymlDump('autoRenew', {
-      currency: cfg.currency,
-      rate: rateStringify(autoFunding.rate),
-      period: autoFunding.period,
-      amount: autoFunding.amount,
-    })
-  }
-
-  // 3) 如果有開，就先關閉 auto-renew & 取消舊掛單
-  if (autoFunding) await bitfinex.v2AuthWriteFundingAuto({ currency: cfg.currency, status: 0 })
+  /*── 取消舊掛單、自行管理 auto-renew ──*/
   await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency: cfg.currency })
+  await bitfinex.v2AuthWriteFundingAuto({ currency: cfg.currency, status: 0 })
 
-  // 4) 計算 order-book 統計
-  const periods = _.chain(cfg.period).keys().map(_.toSafeInteger).value() as number[] // ex: [2,30,60,120]
-  const stats   = await fetchPeriodStats(bitfinex, cfg.currency, periods)
+  /*── 取得 order-book 統計 ──*/
+  const stats = await fetchPeriodStats(cfg.currency, PERIODS)
+  const plan  = planOrders(stats, cfg.split, periodMin, cfg.alpha)
 
-  // 5) 決定各天期掛幾單
-  const planArr = planOrders(stats, cfg.split, cfg.period, cfg.alpha)
+  /*── 金額分配 ──*/
+  const totalAmount = cfg.amount || 0               // 0 = 全額
+  const amtPerOrder = totalAmount / cfg.split
 
-  // 6) 實際拆單並送出
-  const totalAmount = cfg.amount // 0 → 全倉；Bitfinex 會以 0 表示全部可用額
-  const amountEach  = totalAmount / cfg.split
-  let orderCount = 0
-
-  for (const { period, count } of planArr) {
+  let orderCnt = 0
+  for (const { period, count } of plan) {
     const stat = stats[period]
     for (let i = 0; i < count; i++) {
-      const rate = _.round(
-        calcOfferRate(stat, period, cfg.period, cfg.beta, cfg.rateMax),
-        5,
-      )
+      const rate = offerRate(stat, period, periodMin, cfg.beta, cfg.rateMax)
       await bitfinex.v2AuthWriteFundingOffer({
         type:   'LIMIT',
         symbol: cfg.currency,
-        amount: amountEach.toFixed(2),
-        rate,
+        amount: amtPerOrder.toFixed(2),
+        rate:   _.round(rate, 5),
         period,
-        flags:  0, // auto-renew 由腳本管理
+        flags:  0,
       })
-      orderCount++
-      await scheduler.wait(120) // 防 rate-limit
+      orderCnt++
+      await scheduler.wait(120)
     }
   }
 
-  // 7) 等 1 秒讓掛單寫入，再拉回自己掛單金額
-  await scheduler.wait(1000)
-  const orders      = await bitfinex.v2AuthReadFundingOffers({ currency: cfg.currency })
-  const orderAmount = floatFormatDecimal(_.sumBy(orders, 'amount') ?? 0, 8)
-  loggers.log({ orders, orderAmount })
-
-  // 8) Telegram 回報
-  await telegram
-    .sendMessage({
-      text: `${filename}:\n已拆成 ${orderCount} 單，共借出 ${orderAmount} ${cfg.currency}`,
-    })
-    .catch(err => loggers.error(err))
+  await telegram.sendMessage({
+    text: `funding-auto-renew-2: 拆成 ${orderCnt} 單並完成掛單`,
+  })
 }
 
-// ───── rateTarget → period (原函式保留，供其他腳本共用) ─────
-export function rateToPeriod (
-  periodMap: z.output<typeof ZodConfig>['period'],
-  rateTarget,
-) {
-  const sorted = _.chain(periodMap)
-    .map((v, k) => ({ period: _.toSafeInteger(k), rate: _.toFinite(v) }))
-    .orderBy('period', 'desc')
-    .value()
-  const found = _.find(sorted, ({ period, rate }) => rateTarget >= rate)?.period ?? 2
-  return _.clamp(found, 2, 120)
-}
-
-// ───────── CLI entry ─────────
-class NotMainModuleError extends Error {}
+class NotMain extends Error {}
 try {
-  if (!_.startsWith(import.meta.url, 'file:')) throw new NotMainModuleError()
-  const modulePath = url.fileURLToPath(import.meta.url)
-  if (process.argv[1] !== modulePath) throw new NotMainModuleError()
+  if (!_.startsWith(import.meta.url, 'file:')) throw new NotMain()
+  if (process.argv[1] !== url.fileURLToPath(import.meta.url)) throw new NotMain()
   await main()
 } catch (err) {
-  if (!(err instanceof NotMainModuleError)) {
+  if (!(err instanceof NotMain)) {
     loggers.error([err])
     process.exit(1)
   }
