@@ -63,6 +63,7 @@ const ZodConfig = z.object({
 
 // ───────── 1. 取得 order-book 統計 ─────────
 async function fetchPeriodStats (
+  bfx: Bitfinex,
   currency: string,
   periods: number[],
   len = 250,
@@ -71,7 +72,7 @@ async function fetchPeriodStats (
   for (const p of periods) stats[p] = { volume: 0, rateSum: 0, rateMax: 0 }
 
   for (const p of periods) {
-    const rows = await Bitfinex.v2FundingBook(currency, p, { len }) as [string, string][]
+    const rows = await bfx.v2RestFundingBook(currency, p, { len }) as [string, string][]
     for (const [rateStr, amtStr] of rows) {
       const rate = Number(rateStr)
       const amt  = Math.abs(Number(amtStr))
@@ -183,7 +184,7 @@ export async function main (): Promise<void> {
 
   // 4) 計算 order-book 統計
   const periods = _.chain(cfg.period).keys().map(_.toSafeInteger).value() as number[] // ex: [2,30,60,120]
-  const stats   = await fetchPeriodStats(cfg.currency, periods)
+  const stats   = await fetchPeriodStats(bitfinex, cfg.currency, periods)
 
   // 5) 決定各天期掛幾單
   const planArr = planOrders(stats, cfg.split, cfg.period, cfg.alpha)
