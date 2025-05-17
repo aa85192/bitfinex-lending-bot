@@ -16,9 +16,9 @@ env:
 jobs:
   bitfinex:
     # 避免被 fork 的 repository 觸發，請改成自己的 GitHub 帳號
-    if: github.repository_owner == 'taichunmin'
+    if: github.repository_owner == 'aa85192'
     # 這個名字必須跟 repo 的 Environments 名稱一樣
-    environment: taichunmin-usd-1
+    environment: aa85192
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
