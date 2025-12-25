@@ -46,7 +46,7 @@ export async function main (): Promise<void> {
   ymlDump('input', cfg)
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
     loggers.error('Bitfinex API is in maintenance mode')
-    return
+    process.exit(1)
   }
   if (cfg.currencys.length === 0) {
     loggers.error('No currency specified')
