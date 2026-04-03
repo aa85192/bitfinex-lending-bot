@@ -5,7 +5,7 @@ on:
   schedule:
     # timezone: UTC
     # 避開整點時間，因為有可能會有時間上的延誤
-    - cron: '6-56/10 * * * *'
+    - cron: '5-55/10 * * * *'
 
 env:
   BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
