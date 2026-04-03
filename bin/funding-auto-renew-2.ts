@@ -90,40 +90,33 @@ export async function main (): Promise<void> {
   }
 
   // get candles
+  const yesterday = dayjs().add(-1, 'day').add(-1, 'second').toDate()
   const candles = await Bitfinex.v2CandlesHist({
     aggregation: 30,
     currency: cfg.currency,
-    limit: 1441, // 1 day + 1 min
+    limit: 10000,
     periodEnd: 30,
     periodStart: 2,
     sort: BitfinexSort.DESC,
+    start: yesterday,
     timeframe: '1m',
   })
 
   // ranges
-  const yesterday = dayjs().add(-1, 'day').add(-1, 'second').toDate()
   const ranges = _.chain(candles)
-    .filter(candle => candle.mts >= yesterday && candle.volume > 0)
-    .map(candle => {
-      const [open, close, high, low, volume] = _.chain(candle)
-        .pick(['open', 'close', 'high', 'low', 'volume'])
-        .map(num => BigInt(_.round(num * 1e8)))
-        .value()
-      return [
+    .map(({ open, close, high, low, volume }) => _.map([
         _.min([open, close, high, low]), // min * 1e8
         _.max([open, close, high, low]), // high * 1e8
-        volume, // volume
-      ] as [bigint, bigint, bigint]
-    })
+        volume, // volume * 1e8
+      ], (num: number) => BigInt(_.round(num * 1e8))))
+    .filter(([low, high, volume]) => volume > 0n)
     .sortBy([0, 1, 2])
     .value()
   // sum duplicate ranges
   for (let i = 1; i < ranges.length; i++) {
     const [low, high, volume] = ranges[i]
-    if (volume > 0n) {
-      if (low !== ranges[i - 1][0] || high !== ranges[i - 1][1]) continue
-      ranges[i - 1][2] += volume
-    }
+    if (low !== ranges[i - 1][0] || high !== ranges[i - 1][1]) continue
+    ranges[i - 1][2] += volume
     ranges.splice(i, 1)
     i--
   }
@@ -213,13 +206,20 @@ export async function main (): Promise<void> {
   }
 }
 
-export function rateToPeriod (periodMap: z.output<typeof ZodConfig>['period'], rateTarget) {
-  const sortedPeriods = _.chain(periodMap)
-    .map((v, k) => ({ peroid: _.toSafeInteger(k), rate: _.toFinite(v) }))
-    .orderBy(['peroid'], ['desc'])
-    .value()
-  const periodTarget = _.find(sortedPeriods, ({ peroid, rate }) => rateTarget >= rate)?.peroid ?? 2
-  return _.clamp(periodTarget, 2, 120)
+export function rateToPeriod (periodMap: z.output<typeof ZodConfig>['period'], rateTarget: number): number {
+  const ctxPeriod: Record<string, number | null> = { lower: null, target: null, upper: null }
+  for (const entry of _.entries(periodMap)) {
+    const [period, rate] = [_.toSafeInteger(entry[0]), _.toFinite(entry[1])]
+    if (rateTarget >= rate) ctxPeriod.lower = _.max([ctxPeriod.lower ?? period, period])
+    if (rateTarget <= rate) ctxPeriod.upper = _.min([ctxPeriod.upper ?? period, period])
+  }
+
+  if (_.isNil(ctxPeriod.lower)) ctxPeriod.target = 2
+  else if (_.isNil(ctxPeriod.upper)) ctxPeriod.target = ctxPeriod.lower
+  else if (ctxPeriod.lower === ctxPeriod.upper) ctxPeriod.target = ctxPeriod.lower
+  else ctxPeriod.target = Math.trunc(ctxPeriod.lower + (ctxPeriod.upper - ctxPeriod.lower) * (rateTarget - periodMap[ctxPeriod.lower]) / (periodMap[ctxPeriod.upper] - periodMap[ctxPeriod.lower]))
+
+  return _.clamp(ctxPeriod.target, 2, 120)
 }
 
 class NotMainModuleError extends Error {}
