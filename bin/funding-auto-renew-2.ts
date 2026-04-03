@@ -181,29 +181,26 @@ export async function main (): Promise<void> {
 
   if (_.isMatchWith(autoFunding ?? {}, target, floatIsEqual)) {
     loggers.log('Setting of auto-renew no change.')
-    return
+  } else {
+    if (autoFunding) await bitfinex.v2AuthWriteFundingAuto({ ..._.pick(cfg, ['currency']), status: 0 })
+    await bitfinex.v2AuthWriteFundingOfferCancelAll(_.pick(cfg, ['currency']))
+    await bitfinex.v2AuthWriteFundingAuto({
+      ..._.pick(cfg, ['currency', 'amount']),
+      period: target.period,
+      rate: target.rate * 100, // percentage of rate
+      status: 1,
+    }).catch(err => { throw _.merge(err, { data: { target } }) })
+    await scheduler.wait(1000) // 等待 1 秒鐘，讓掛單生效
   }
 
-  if (autoFunding) await bitfinex.v2AuthWriteFundingAuto({ ..._.pick(cfg, ['currency']), status: 0 })
-  await bitfinex.v2AuthWriteFundingOfferCancelAll(_.pick(cfg, ['currency']))
-  await bitfinex.v2AuthWriteFundingAuto({
-    ..._.pick(cfg, ['currency', 'amount']),
-    period: target.period,
-    rate: target.rate * 100, // percentage of rate
-    status: 1,
-  }).catch(err => { throw _.merge(err, { data: { target } }) })
-
   // 取得掛單並計算掛單中的總金額
-  await scheduler.wait(1000) // 等待 1 秒鐘，讓掛單生效
   const orders = await bitfinex.v2AuthReadFundingOffers({ currency: cfg.currency })
   const orderAmount = floatFormatDecimal(_.sumBy(orders, 'amount') ?? 0, 8)
   loggers.log({ orders, orderAmount })
 
-  if (orderAmount !== '0.00000000') {
-    await telegram.sendMessage({
-      text: `${filename}:\n以 ${rateStringify(target.rate)} 利率自動借出 ${orderAmount} ${cfg.currency}，最多 ${target.period} 天`,
-    }).catch(loggers.error)
-  }
+  await telegram.sendMessage({
+    text: `${filename}:\n以 ${rateStringify(target.rate)} 利率自動借出 ${orderAmount} ${cfg.currency}，最多 ${target.period} 天`,
+  }).catch(loggers.error)
 }
 
 export function rateToPeriod (periodMap: z.output<typeof ZodConfig>['period'], rateTarget: number): number {
